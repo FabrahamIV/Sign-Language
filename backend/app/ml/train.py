@@ -441,6 +441,161 @@ def train_from_sqlite_dataset(
     return summary
 
 
+def train_from_csv_dataset(
+    csv_path: Path,
+    epochs: int = 45,
+    batch_size: int = 64,
+    learning_rate: float = 3e-3,
+    seed: int = 42,
+    verbose: bool = True,
+) -> Dict[str, Any]:
+    """Train StaticSignMLP on any external CSV dataset (SIBI, BISINDO, ASL).
+
+    Auto-detects either raw landmark columns (`x0,y0,z0..x20,y20,z20`) or pre-normalized
+    columns (`f_0..f_62` or any 63 numeric feature columns) and splits into Train/Val/Test
+    BEFORE normalization.
+    """
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+
+    df = pd.read_csv(csv_path)
+    label_col = "label" if "label" in df.columns else ("class" if "class" in df.columns else df.columns[0])
+    df = df.dropna(subset=[label_col]).copy()
+    df[label_col] = df[label_col].astype(str).str.strip().str.upper()
+
+    raw_xyz_cols = [f"{axis}{i}" for i in range(21) for axis in ("x", "y", "z")]
+    norm_f_cols = [f"f_{i}" for i in range(63)]
+
+    if all(c in df.columns for c in raw_xyz_cols):
+        feat_cols = raw_xyz_cols
+        needs_normalization = True
+    elif all(c in df.columns for c in norm_f_cols):
+        feat_cols = norm_f_cols
+        needs_normalization = False
+    else:
+        numeric_cols = [c for c in df.columns if c != label_col and pd.api.types.is_numeric_dtype(df[c])]
+        if len(numeric_cols) < 63:
+            raise ValueError(
+                f"CSV must contain at least 63 numeric landmark columns (found {len(numeric_cols)})."
+            )
+        feat_cols = numeric_cols[:63]
+        needs_normalization = True
+
+    df = df.dropna(subset=feat_cols).reset_index(drop=True)
+    # Keep classes with at least 5 samples
+    counts = df[label_col].value_counts()
+    valid_classes = sorted(counts[counts >= 5].index.tolist())
+    if len(valid_classes) < 2:
+        raise ValueError("Dataset must have at least 2 classes with >= 5 samples each.")
+    df = df[df[label_col].isin(valid_classes)].reset_index(drop=True)
+    class_to_idx = {c: i for i, c in enumerate(valid_classes)}
+
+    # Strict featurization ordering: split BEFORE normalization
+    train_df, temp_df = train_test_split(df, test_size=0.30, stratify=df[label_col], random_state=seed)
+    val_df, test_df = train_test_split(temp_df, test_size=0.50, stratify=temp_df[label_col], random_state=seed)
+
+    def _to_arrays(split_df: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray]:
+        mat = split_df[feat_cols].to_numpy(dtype=np.float32)
+        if needs_normalization:
+            mat = np.stack([normalize_hand_array(row.reshape(21, 3)) for row in mat], axis=0)
+        y = np.array([class_to_idx[c] for c in split_df[label_col]], dtype=np.int64)
+        return mat, y
+
+    X_train, y_train = _to_arrays(train_df)
+    X_val, y_val = _to_arrays(val_df)
+    X_test, y_test = _to_arrays(test_df)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = StaticSignMLP(input_dim=63, num_classes=len(valid_classes)).to(device)
+    train_loader = DataLoader(
+        TensorDataset(torch.from_numpy(X_train), torch.from_numpy(y_train)),
+        batch_size=min(batch_size, max(8, len(X_train))),
+        shuffle=True,
+        drop_last=len(X_train) > batch_size and (len(X_train) % batch_size == 1),
+    )
+
+    criterion = nn.CrossEntropyLoss(label_smoothing=0.03)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=1e-4)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+
+    best_val_f1 = -1.0
+    best_state_dict = None
+    X_val_t = torch.from_numpy(X_val).to(device)
+
+    for _ in range(epochs):
+        model.train()
+        for bx, by in train_loader:
+            if len(bx) < 2:
+                continue
+            bx, by = bx.to(device), by.to(device)
+            optimizer.zero_grad()
+            loss = criterion(model(bx), by)
+            loss.backward()
+            optimizer.step()
+        scheduler.step()
+
+        model.eval()
+        with torch.no_grad():
+            val_preds = torch.argmax(model(X_val_t), dim=1).cpu().numpy()
+            val_f1 = float(f1_score(y_val, val_preds, average="macro", zero_division=0))
+            if val_f1 >= best_val_f1:
+                best_val_f1 = val_f1
+                best_state_dict = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+
+    if best_state_dict is not None:
+        model.load_state_dict(best_state_dict)
+
+    model.eval()
+    with torch.no_grad():
+        val_preds = torch.argmax(model(X_val_t), dim=1).cpu().numpy()
+        test_preds = torch.argmax(model(torch.from_numpy(X_test).to(device)), dim=1).cpu().numpy()
+
+    val_acc = float(accuracy_score(y_val, val_preds))
+    val_f1_macro = float(f1_score(y_val, val_preds, average="macro", zero_division=0))
+    test_acc = float(accuracy_score(y_test, test_preds))
+    test_f1_macro = float(f1_score(y_test, test_preds, average="macro", zero_division=0))
+
+    WEIGHTS_DIR.mkdir(parents=True, exist_ok=True)
+    torch.save(
+        {
+            "model_state_dict": model.cpu().state_dict(),
+            "classes": valid_classes,
+            "is_custom_trained": True,
+            "val_f1_macro": val_f1_macro,
+            "test_f1_macro": test_f1_macro,
+        },
+        STATIC_WEIGHTS_PATH,
+    )
+
+    summary: Dict[str, Any] = {
+        "model_name": f"External Real Dataset MLP ({len(valid_classes)} Classes)",
+        "num_classes": len(valid_classes),
+        "classes": valid_classes,
+        "is_custom_trained": True,
+        "val_accuracy": round(val_acc, 4),
+        "val_f1_macro": round(val_f1_macro, 4),
+        "test_accuracy": round(test_acc, 4),
+        "test_f1_macro": round(test_f1_macro, 4),
+        "train_samples": int(len(X_train)),
+        "val_samples": int(len(X_val)),
+        "test_samples": int(len(X_test)),
+        "trained_at": datetime.now(timezone.utc).isoformat(),
+    }
+    METADATA_PATH.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    try:
+        SignStreamDatabase().save_model_evaluation(summary)
+    except Exception:
+        pass
+
+    if verbose:
+        print(
+            f"[SignStream CSV Train] {len(valid_classes)} classes | "
+            f"Val Acc: {val_acc:.2%}, Val Macro-F1: {val_f1_macro:.2%} | "
+            f"Test Acc: {test_acc:.2%}, Test Macro-F1: {test_f1_macro:.2%}"
+        )
+    return summary
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Train SignStream StaticSignMLP")
     parser.add_argument("--csv", type=str, default=None, help="Path to CSV landmark dataset")
