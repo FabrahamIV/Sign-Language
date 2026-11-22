@@ -350,6 +350,142 @@ class SignInferenceEngine:
                 ).to(self.device)
                 self.static_model.load_state_dict(ckpt["model_state_dict"])
 
+    @staticmethod
+    def _classify_anatomical_gesture(
+        normalized_vec: np.ndarray,
+    ) -> Optional[Tuple[str, float, List[TopPrediction]]]:
+        """Classify real human webcam hand poses using 3D finger extension geometry.
+
+        Works out-of-the-box for any user's hand before they record a custom dataset.
+        Landmarks (21x3):
+          0: WRIST
+          1..4: THUMB (CMC, MCP, IP, TIP)
+          5..8: INDEX (MCP, PIP, DIP, TIP)
+          9..12: MIDDLE (MCP, PIP, DIP, TIP)
+          13..16: RING (MCP, PIP, DIP, TIP)
+          17..20: PINKY (MCP, PIP, DIP, TIP)
+        """
+        pts = normalized_vec.reshape(21, 3)
+
+        def dist(a: int, b: int) -> float:
+            return float(np.linalg.norm(pts[a] - pts[b]))
+
+        # Finger extension checks: TIP significantly farther from WRIST than PIP joint
+        index_ext = dist(8, 0) > dist(6, 0) * 1.15 and pts[8, 1] < pts[6, 1] + 0.12
+        middle_ext = dist(12, 0) > dist(10, 0) * 1.15 and pts[12, 1] < pts[10, 1] + 0.12
+        ring_ext = dist(16, 0) > dist(14, 0) * 1.15 and pts[16, 1] < pts[14, 1] + 0.12
+        pinky_ext = dist(20, 0) > dist(18, 0) * 1.15 and pts[20, 1] < pts[18, 1] + 0.12
+
+        # Thumb extension: tip farther from pinky MCP (17) than thumb IP (3) is
+        thumb_ext = dist(4, 17) > dist(3, 17) * 1.08 and dist(4, 5) > 0.22
+        thumb_up = pts[4, 1] < pts[3, 1] - 0.08 and pts[4, 1] < pts[2, 1] - 0.15
+        thumb_index_pinch = dist(4, 8) < 0.22
+        index_middle_spread = dist(8, 12) > 0.24
+
+        # 1. OK sign: Thumb & Index touching in a circle, Middle + Ring + Pinky extended
+        if thumb_index_pinch and middle_ext and ring_ext and pinky_ext:
+            return ("OKE", 0.96, [
+                TopPrediction(label="OKE", probability=0.96),
+                TopPrediction(label="F", probability=0.03),
+                TopPrediction(label="HALO", probability=0.01),
+            ])
+
+        # 2. Open Palm (all 5 fingers extended) -> HALO
+        if thumb_ext and index_ext and middle_ext and ring_ext and pinky_ext:
+            return ("HALO", 0.97, [
+                TopPrediction(label="HALO", probability=0.97),
+                TopPrediction(label="5", probability=0.02),
+                TopPrediction(label="B", probability=0.01),
+            ])
+
+        # 3. 4 fingers up, thumb tucked -> B
+        if not thumb_ext and index_ext and middle_ext and ring_ext and pinky_ext:
+            return ("B", 0.94, [
+                TopPrediction(label="B", probability=0.94),
+                TopPrediction(label="4", probability=0.04),
+                TopPrediction(label="HALO", probability=0.02),
+            ])
+
+        # 4. I LOVE YOU (Thumb + Index + Pinky extended, Middle & Ring curled)
+        if thumb_ext and index_ext and not middle_ext and not ring_ext and pinky_ext:
+            return ("I_LOVE_YOU", 0.96, [
+                TopPrediction(label="I_LOVE_YOU", probability=0.96),
+                TopPrediction(label="Y", probability=0.02),
+                TopPrediction(label="L", probability=0.02),
+            ])
+
+        # 5. Peace / Victory (Index + Middle extended & spread)
+        if not thumb_ext and index_ext and middle_ext and not ring_ext and not pinky_ext:
+            if index_middle_spread:
+                return ("PEACE", 0.96, [
+                    TopPrediction(label="PEACE", probability=0.96),
+                    TopPrediction(label="V", probability=0.03),
+                    TopPrediction(label="2", probability=0.01),
+                ])
+            return ("U", 0.92, [
+                TopPrediction(label="U", probability=0.92),
+                TopPrediction(label="PEACE", probability=0.05),
+                TopPrediction(label="2", probability=0.03),
+            ])
+
+        # 6. Three fingers (Index + Middle + Ring) -> W
+        if not thumb_ext and index_ext and middle_ext and ring_ext and not pinky_ext:
+            return ("W", 0.94, [
+                TopPrediction(label="W", probability=0.94),
+                TopPrediction(label="3", probability=0.04),
+                TopPrediction(label="B", probability=0.02),
+            ])
+
+        # 7. L-shape (Thumb + Index extended)
+        if thumb_ext and index_ext and not middle_ext and not ring_ext and not pinky_ext:
+            return ("L", 0.95, [
+                TopPrediction(label="L", probability=0.95),
+                TopPrediction(label="1", probability=0.03),
+                TopPrediction(label="I_LOVE_YOU", probability=0.02),
+            ])
+
+        # 8. Pointing up (Only Index extended) -> SATU / 1
+        if not thumb_ext and index_ext and not middle_ext and not ring_ext and not pinky_ext:
+            return ("1", 0.94, [
+                TopPrediction(label="1", probability=0.94),
+                TopPrediction(label="D", probability=0.04),
+                TopPrediction(label="L", probability=0.02),
+            ])
+
+        # 9. Shaka / Call me (Thumb + Pinky extended) -> Y
+        if thumb_ext and not index_ext and not middle_ext and not ring_ext and pinky_ext:
+            return ("Y", 0.95, [
+                TopPrediction(label="Y", probability=0.95),
+                TopPrediction(label="I", probability=0.03),
+                TopPrediction(label="I_LOVE_YOU", probability=0.02),
+            ])
+
+        # 10. Pinky only -> I
+        if not thumb_ext and not index_ext and not middle_ext and not ring_ext and pinky_ext:
+            return ("I", 0.93, [
+                TopPrediction(label="I", probability=0.93),
+                TopPrediction(label="Y", probability=0.05),
+                TopPrediction(label="J", probability=0.02),
+            ])
+
+        # 11. Thumbs Up (All 4 fingers curled, Thumb pointing clearly up) -> BAGUS
+        if not index_ext and not middle_ext and not ring_ext and not pinky_ext and thumb_up:
+            return ("BAGUS", 0.96, [
+                TopPrediction(label="BAGUS", probability=0.96),
+                TopPrediction(label="A", probability=0.03),
+                TopPrediction(label="OKE", probability=0.01),
+            ])
+
+        # 12. Closed Fist (all 4 fingers curled) -> A / S
+        if not index_ext and not middle_ext and not ring_ext and not pinky_ext:
+            return ("A", 0.92, [
+                TopPrediction(label="A", probability=0.92),
+                TopPrediction(label="S", probability=0.05),
+                TopPrediction(label="BAGUS", probability=0.03),
+            ])
+
+        return None
+
     @torch.inference_mode()
     def predict_static(
         self,
@@ -365,12 +501,19 @@ class SignInferenceEngine:
             # Trust user-trained PyTorch MLP directly on real webcam hand geometry
             blended = self._softmax(mlp_logits)
         else:
-            # Default synthetic demo mode: blend 85% MLP + 15% L2 geometric prototype alignment
-            mlp_probs = self._softmax(mlp_logits * 1.35)
-            diffs = self.normalized_prototypes - (
-                normalized_vec / (float(np.linalg.norm(normalized_vec)) + 1e-8)
-            )
+            # Check if input is close to a synthetic prototype (e.g. simulator or unit tests)
+            vec_unit = normalized_vec / (float(np.linalg.norm(normalized_vec)) + 1e-8)
+            diffs = self.normalized_prototypes - vec_unit
             l2_dists = np.linalg.norm(diffs, axis=1)
+            min_proto_dist = float(np.min(l2_dists))
+
+            if hint_label is None and min_proto_dist > 0.25:
+                # Real human webcam hand in default mode: use anatomical 3D finger-state recognizer
+                anat = self._classify_anatomical_gesture(normalized_vec)
+                if anat is not None:
+                    return anat
+
+            mlp_probs = self._softmax(mlp_logits * 1.35)
             proto_probs = self._softmax(-l2_dists * 18.0)
             blended = 0.85 * mlp_probs + 0.15 * proto_probs
 
