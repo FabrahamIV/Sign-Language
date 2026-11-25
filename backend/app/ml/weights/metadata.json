@@ -57,7 +57,7 @@
     "invalid_label_rows_dropped": 0,
     "final_valid_rows": 2400
   },
-  "trained_at": "2026-11-03T08:18:19.267931+00:00",
+  "trained_at": "2026-11-23T11:53:18.218962+00:00",
   "confusion_matrix_summary": {
     "A": 1.0,
     "B": 1.0,
